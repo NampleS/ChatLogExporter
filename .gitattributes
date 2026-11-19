@@ -1,0 +1,8 @@
+# The plugin file is signed byte-for-byte. Never let git rewrite its line
+# endings, or the downloaded copy won't match the ed25519 signature.
+ChatLogExporter.plugin.js -text
+version.json -text
+*.sig -text
+
+# Windows batch installer stays CRLF.
+*.cmd text eol=crlf
