@@ -1,7 +1,7 @@
 /**
  * @name ChatLogExporter
  * @author NampleS
- * @version 2.6.13
+ * @version 2.6.14
  * @description Collects every accessible Discord message and exports an LLM-friendly AI Archive containing structured JSONL, readable Markdown, identity maps, and channel hierarchy metadata. Also exports a selected message range as a long Discord-style screenshot image (copy to clipboard or save to file).
  */
 
@@ -21,7 +21,7 @@ const UPDATE_RAW_BASE = `https://raw.githubusercontent.com/${UPDATE_REPO}/${UPDA
 module.exports = class ChatLogExporter {
 	constructor () {
 		this.name = "ChatLogExporter";
-		this.version = "2.6.13";
+		this.version = "2.6.14";
 		this.defaultSettings = {
 			pageSize: 100,
 			fetchDelayMs: 350,
@@ -1402,20 +1402,282 @@ module.exports = class ChatLogExporter {
 		if (jobs.length) await Promise.all(jobs);
 	}
 
-	hasPlaceholder (scope) {
-		try {return !!scope.querySelector('[class*="placeholder"], [class*="Placeholder"], [class*="skeleton"], [class*="Skeleton"]');}
-		catch (_) {return false;}
+	async buildFontEmbedCss (list) {
+		if (this.shotFontCss != null) return this.shotFontCss;
+		const wanted = new Set();
+		try {
+			const fam = getComputedStyle(list || document.body).fontFamily || "";
+			for (let name of fam.split(",")) {name = name.trim().replace(/^['"]|['"]$/g, "").toLowerCase(); if (name && !/^(sans-serif|serif|monospace|system-ui|ui-|-apple|blinkmac|segoe|roboto|helvetica|arial|emoji)/.test(name)) wanted.add(name);}
+		}
+		catch (_) {}
+		const faces = [];
+		try {
+			for (const sheet of Array.from(document.styleSheets || [])) {
+				let rules = null; try {rules = sheet.cssRules;} catch (_) {continue;}
+				if (!rules) continue;
+				for (const rule of Array.from(rules)) {
+					if (rule && rule.type === 5 && rule.style) {
+						const fam = rule.style.getPropertyValue("font-family");
+						const bare = String(fam || "").trim().replace(/^['"]|['"]$/g, "").toLowerCase();
+						if (wanted.size && !wanted.has(bare)) continue;
+						const src = rule.style.getPropertyValue("src");
+						if (fam && src) faces.push({fam, src, weight: rule.style.getPropertyValue("font-weight") || "normal", style: rule.style.getPropertyValue("font-style") || "normal", base: sheet.href || document.baseURI});
+					}
+				}
+			}
+		}
+		catch (_) {}
+		const pick = []; const seen = new Set();
+		for (const f of faces) {
+			if (f.style && f.style !== "normal") continue;
+			const m = /url\(\s*(['"]?)([^'")]+\.woff2[^'")]*)\1\s*\)/i.exec(f.src) || /url\(\s*(['"]?)([^'")]+)\1\s*\)/i.exec(f.src);
+			if (!m) continue;
+			let u = m[2];
+			const key = f.fam + "|" + f.weight;
+			if (seen.has(key)) continue; seen.add(key);
+			if (!/^data:/i.test(u)) {try {u = new URL(u, f.base).href;} catch (_) {continue;}}
+			pick.push({fam: f.fam, weight: f.weight, style: f.style, url: u});
+			if (pick.length >= 6) break;
+		}
+		const collected = [];
+		const tasks = pick.map(async f => {
+			let data = f.url;
+			if (!/^data:/i.test(data)) {data = await this.fetchImageDataUrl(f.url, {maxBytes: 2 * 1024 * 1024, timeout: 3000}).catch(() => null);}
+			if (data) collected.push(`@font-face{font-family:${f.fam};font-style:${f.style};font-weight:${f.weight};src:url(${data});}`);
+		});
+		await Promise.race([Promise.allSettled(tasks), this.sleepShot(3000)]);
+		this.shotFontCss = collected.join("\n");
+		return this.shotFontCss;
 	}
 
-	isPlaceholderRow (row) {
+	// Deep-clone a live element, baking every computed style into inline style.
+	// getComputedStyle(el).cssText returns "" in Chromium, so we build it by
+	// iterating properties. Skips display:none subtrees and external url() in
+	// backgrounds/masks/custom-vars; swaps <img>/<image> to pre-fetched data URLs.
+	cloneWithInlineStyles (srcEl) {
+		const BLANK = "data:image/svg+xml," + encodeURIComponent('<svg xmlns="http://www.w3.org/2000/svg"/>');
+		const SKIP_TAGS = {SCRIPT: 1, NOSCRIPT: 1, TEMPLATE: 1, LINK: 1, META: 1};
+		const SKIP_PROP = /^(animation|transition|cursor|pointer-events|user-select|-webkit-user-|-webkit-tap|-webkit-font-smoothing|-webkit-locale|-webkit-text-size-adjust|caret-color|accent-color|scroll-|overscroll|touch-action|will-change|contain|content-visibility|speak|resize|appearance|-webkit-appearance|tab-size|-webkit-box-reflect|view-transition|anchor-|field-sizing|-webkit-rtl-ordering|-webkit-highlight)/;
+		const swapImageUrl = (clone, src) => {
+			const key = this.imgNodeUrl(src);
+			if (!key || /^data:/i.test(key)) return;
+			const data = this.shotImgCache.get(key) || BLANK;
+			if ((src.tagName || "").toLowerCase() === "image") {
+				clone.setAttribute("href", data);
+				try {clone.setAttributeNS("http://www.w3.org/1999/xlink", "href", data);} catch (_) {}
+			}
+			else {clone.setAttribute("src", data); clone.removeAttribute("srcset"); try {clone.srcset = "";} catch (_) {}}
+		};
+		const build = src => {
+			if (src.nodeType === 3) return document.createTextNode(src.nodeValue);
+			if (src.nodeType !== 1) return null;
+			if (SKIP_TAGS[src.tagName]) return null;
+			let cs = null; try {cs = getComputedStyle(src);} catch (_) {}
+			if (cs && cs.display === "none") return null;
+			const clone = src.cloneNode(false);
+			if (cs) {
+				try {
+					let txt = "";
+					for (let i = 0; i < cs.length; i++) {
+						const p = cs[i];
+						if (SKIP_PROP.test(p)) continue;
+						const v = cs.getPropertyValue(p);
+						if (p.charCodeAt(0) === 45 && p.charCodeAt(1) === 45 && v.indexOf("url(") >= 0) continue;
+						txt += p + ":" + v + ";";
+					}
+					clone.style.cssText = txt;
+					const bi = clone.style.backgroundImage;
+					if (bi && bi.indexOf("url(") >= 0) {
+						const m = /url\(\s*(['"]?)(https?:[^'")]+)\1\s*\)/i.exec(bi);
+						const data = m && this.shotImgCache.get(m[2]);
+						clone.style.backgroundImage = data ? `url(${data})` : "none";
+					}
+					const mi = clone.style.getPropertyValue("mask-image"); if (mi && mi.indexOf("url(") >= 0) clone.style.setProperty("mask-image", "none");
+					const wm = clone.style.getPropertyValue("-webkit-mask-image"); if (wm && wm.indexOf("url(") >= 0) clone.style.setProperty("-webkit-mask-image", "none");
+				}
+				catch (_) {}
+			}
+			const tag = (clone.tagName || "").toLowerCase();
+			if (tag === "img" || tag === "image") {
+				try {swapImageUrl(clone, src);} catch (_) {}
+			}
+			else if (clone.tagName === "CANVAS" || clone.tagName === "VIDEO") {
+				try {
+					const w = src.clientWidth || 0, h = src.clientHeight || 0;
+					const img = document.createElement("img");
+					img.setAttribute("style", clone.style.cssText);
+					try {if (src.tagName === "CANVAS") img.setAttribute("src", src.toDataURL("image/png"));} catch (_) {}
+					if (!img.getAttribute("src")) img.setAttribute("src", BLANK);
+					if (w) img.width = w; if (h) img.height = h;
+					return img;
+				}
+				catch (_) {}
+			}
+			for (const child of Array.from(src.childNodes)) {
+				const cc = build(child);
+				if (cc) clone.appendChild(cc);
+			}
+			return clone;
+		};
+		return build(srcEl) || srcEl.cloneNode(false);
+	}
+
+	// Rasterize the TEXT/STYLE layer via SVG <foreignObject>, then draw the images
+	// on top with canvas drawImage (Chromium does not render nested <img> inside a
+	// rasterized foreignObject — that is why avatars were blank).
+	async rasterizeStripHost (host, width, height, bg, fontCss) {
+		const imgJobs = [];
 		try {
-			if (/placeholder|skeleton/i.test(row.className || "")) return true;
-			// A real message row carries a chat-messages id; a still-loading skeleton
-			// row does not. If it has no id AND holds a placeholder/skeleton node,
-			// treat it as not-ready.
-			return !!row.querySelector('[class*="placeholder"], [class*="Placeholder"], [class*="skeleton"], [class*="Skeleton"]');
+			const hostRect = host.getBoundingClientRect();
+			for (const im of host.querySelectorAll("img, image")) {
+				const src = im.getAttribute("src") || im.getAttribute("href") || "";
+				if (!/^data:/i.test(src)) continue;
+				const r = im.getBoundingClientRect();
+				if (r.width < 1 || r.height < 1) continue;
+				let radius = 0; try {radius = parseFloat(getComputedStyle(im).borderTopLeftRadius) || 0;} catch (_) {}
+				imgJobs.push({src, x: r.left - hostRect.left, y: r.top - hostRect.top, w: r.width, h: r.height, radius});
+			}
 		}
-		catch (_) {return false;}
+		catch (_) {}
+		const canvas = await this.rasterizeSvgLayer(host, width, height, bg, fontCss);
+		if (!canvas) return null;
+		if (imgJobs.length) {
+			const scale = canvas.width / width;
+			const ctx = canvas.getContext("2d");
+			await Promise.all(imgJobs.map(j => new Promise(res => {
+				const im = new Image();
+				let done = false; const fin = () => {if (!done) {done = true; clearTimeout(tm); res();}}; const tm = setTimeout(fin, 8000);
+				im.onload = () => {
+					try {
+						const x = j.x * scale, y = j.y * scale, w = j.w * scale, h = j.h * scale;
+						ctx.save();
+						if (j.radius >= Math.min(j.w, j.h) / 2 - 1.5) {ctx.beginPath(); ctx.arc(x + w / 2, y + h / 2, Math.min(w, h) / 2, 0, Math.PI * 2); ctx.clip();}
+						else if (j.radius > 1) {const rr = j.radius * scale; ctx.beginPath(); ctx.moveTo(x + rr, y); ctx.arcTo(x + w, y, x + w, y + h, rr); ctx.arcTo(x + w, y + h, x, y + h, rr); ctx.arcTo(x, y + h, x, y, rr); ctx.arcTo(x, y, x + w, y, rr); ctx.clip();}
+						ctx.drawImage(im, x, y, w, h);
+						ctx.restore();
+					}
+					catch (_) {}
+					fin();
+				};
+				im.onerror = fin;
+				im.src = j.src;
+			})));
+		}
+		return canvas;
+	}
+
+	rasterizeSvgLayer (host, width, height, bg, fontCss) {
+		return new Promise(resolve => {
+			let inner = "";
+			try {const xs = new XMLSerializer(); for (const child of Array.from(host.children)) inner += xs.serializeToString(child);}
+			catch (_) {return resolve(null);}
+			const fontStyle = fontCss ? `<style>${fontCss}</style>` : "";
+			const wrap = `<div xmlns="http://www.w3.org/1999/xhtml" style="width:${width}px; background:${bg || "#313338"};">${fontStyle}${inner}</div>`;
+			const svg = `<svg xmlns="http://www.w3.org/2000/svg" width="${width}" height="${height}"><foreignObject x="0" y="0" width="${width}" height="${height}">${wrap}</foreignObject></svg>`;
+			const url = "data:image/svg+xml;charset=utf-8," + encodeURIComponent(svg);
+			const scale = Math.min(2, Math.max(1, window.devicePixelRatio || 1));
+			const img = new Image();
+			let done = false;
+			const finish = v => {if (done) return; done = true; clearTimeout(timer); resolve(v);};
+			const timer = setTimeout(() => finish(null), 15000);
+			img.onload = () => {
+				try {
+					const canvas = document.createElement("canvas");
+					canvas.width = Math.max(1, Math.round(width * scale));
+					canvas.height = Math.max(1, Math.round(height * scale));
+					const ctx = canvas.getContext("2d");
+					ctx.scale(scale, scale);
+					ctx.fillStyle = bg || "#313338";
+					ctx.fillRect(0, 0, width, height);
+					ctx.drawImage(img, 0, 0);
+					finish(canvas);
+				}
+				catch (_) {finish(null);}
+			};
+			img.onerror = () => finish(null);
+			img.src = url;
+		});
+	}
+
+	async renderBatchStrip (batch, width, bg, fontCss) {
+		const host = document.createElement("div");
+		host.setAttribute("style", `position:fixed; left:-99999px; top:0; width:${width}px; background:${bg || "#313338"}; z-index:-2147483647; pointer-events:none;`);
+		for (const item of batch) {try {host.appendChild(this.cloneWithInlineStyles(item.el));} catch (_) {}}
+		document.body.appendChild(host);
+		let canvas = null;
+		try {
+			const w = Math.max(1, Math.round(host.offsetWidth || width));
+			const h = Math.max(1, Math.round(host.offsetHeight || host.scrollHeight || 1));
+			canvas = await this.rasterizeStripHost(host, w, h, bg, fontCss);
+		}
+		catch (_) {canvas = null;}
+		finally {try {host.remove();} catch (_) {}}
+		return canvas ? {canvas, orderId: batch[0].orderId} : null;
+	}
+
+	// Scroll the open channel from the first selected message to the last and
+	// capture one strip per screenful of newly-seen in-range rows.
+	async captureRangeStrips ({scroller, list, channelId, olderId, newerId, fontCss, bg, onProgress}) {
+		const strips = [];
+		const capturedIds = new Set();
+		const capturedDiv = new Set();
+		let messageCount = 0;
+		const step = () => Math.max(120, Math.round(scroller.clientHeight * 0.85));
+		const contentWidth = list.clientWidth || scroller.clientWidth || 700;
+
+		let guard = 0;
+		while (guard++ < 6000) {
+			if (this.shotCancel) return {strips, messageCount, cancelled: true};
+			if (this.getRowEl(channelId, olderId)) break;
+			const before = scroller.scrollTop;
+			scroller.scrollTop = Math.max(0, scroller.scrollTop - step());
+			await this.sleepShot(95);
+			if (onProgress) onProgress("시작 메시지로 이동하는 중...");
+			if (scroller.scrollTop === 0) {await this.sleepShot(260); if (this.getRowEl(channelId, olderId)) break; if (before === 0) break;}
+		}
+		const startEl = this.getRowEl(channelId, olderId);
+		if (startEl) {try {startEl.scrollIntoView({block: "start"});} catch (_) {} await this.sleepShot(160);}
+
+		let noProgress = 0, iter = 0, endReached = false;
+		while (iter++ < 10000) {
+			if (this.shotCancel) return {strips, messageCount, cancelled: true};
+			for (let w = 0; w < 8 && this.hasPlaceholder(list); w++) await this.sleepShot(180);
+			const rows = Array.from(list.children);
+			const batch = [];
+			let pendingDiv = [];
+			for (const row of rows) {
+				if (this.isPlaceholderRow(row)) {pendingDiv = []; continue;}
+				const mid = this.parseRowMessageId(row);
+				if (mid) {
+					const inRange = this.compareSnowflakes(mid, olderId) >= 0 && this.compareSnowflakes(mid, newerId) <= 0;
+					if (inRange) {
+						for (const d of pendingDiv) {const dk = `d:${mid}:${d.text}`; if (!capturedDiv.has(dk)) {capturedDiv.add(dk); batch.push({el: d.el, orderId: mid});}}
+						pendingDiv = [];
+						if (!capturedIds.has(mid)) {capturedIds.add(mid); messageCount++; batch.push({el: row, orderId: mid});}
+						if (this.compareSnowflakes(mid, newerId) >= 0) endReached = true;
+					}
+					else pendingDiv = [];
+				}
+				else {
+					const text = String(row.textContent || "").trim().replace(/\s+/g, " ").slice(0, 48);
+					pendingDiv.push({el: row, text});
+				}
+			}
+			if (batch.length) {
+				await Promise.all(batch.map(b => this.prefetchRowImages(b.el))).catch(() => {});
+				const strip = await this.renderBatchStrip(batch, contentWidth, bg, fontCss);
+				if (strip) strips.push(strip);
+			}
+			if (onProgress) onProgress(`캡처 중 · ${messageCount.toLocaleString()}개 메시지 · ${strips.length}장`);
+			if (endReached && capturedIds.has(String(newerId))) break;
+
+			const before = scroller.scrollTop;
+			scroller.scrollTop = Math.min(scroller.scrollHeight, scroller.scrollTop + step());
+			await this.sleepShot(110);
+			if (Math.abs(scroller.scrollTop - before) < 2) {noProgress++; if (noProgress >= 4) break;}
+			else noProgress = 0;
+		}
+		return {strips, messageCount};
 	}
 
 	stitchStrips (strips, bg) {
@@ -1437,6 +1699,22 @@ module.exports = class ChatLogExporter {
 			out.push(canvas.toDataURL("image/png"));
 		}
 		return out;
+	}
+
+	hasPlaceholder (scope) {
+		try {return !!scope.querySelector('[class*="placeholder"], [class*="Placeholder"], [class*="skeleton"], [class*="Skeleton"]');}
+		catch (_) {return false;}
+	}
+
+	isPlaceholderRow (row) {
+		try {
+			if (/placeholder|skeleton/i.test(row.className || "")) return true;
+			// A real message row carries a chat-messages id; a still-loading skeleton
+			// row does not. If it has no id AND holds a placeholder/skeleton node,
+			// treat it as not-ready.
+			return !!row.querySelector('[class*="placeholder"], [class*="Placeholder"], [class*="skeleton"], [class*="Skeleton"]');
+		}
+		catch (_) {return false;}
 	}
 
 	// Full-screen overlay that BOTH shows progress AND blocks the user from
