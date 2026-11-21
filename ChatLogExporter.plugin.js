@@ -1,7 +1,7 @@
 /**
  * @name ChatLogExporter
  * @author NampleS
- * @version 2.6.14
+ * @version 2.6.38
  * @description Collects every accessible Discord message and exports an LLM-friendly AI Archive containing structured JSONL, readable Markdown, identity maps, and channel hierarchy metadata. Also exports a selected message range as a long Discord-style screenshot image (copy to clipboard or save to file).
  */
 
@@ -21,7 +21,7 @@ const UPDATE_RAW_BASE = `https://raw.githubusercontent.com/${UPDATE_REPO}/${UPDA
 module.exports = class ChatLogExporter {
 	constructor () {
 		this.name = "ChatLogExporter";
-		this.version = "2.6.14";
+		this.version = "2.6.38";
 		this.defaultSettings = {
 			pageSize: 100,
 			fetchDelayMs: 350,
@@ -38,7 +38,8 @@ module.exports = class ChatLogExporter {
 			includeEditedAt: true,
 			shortcutEnabled: true,
 			outputFolder: "",
-			autoUpdate: true
+			autoUpdate: true,
+			shotMaxHeight: 15000
 		};
 		this.settings = Object.assign({}, this.defaultSettings);
 		this.panel = null;
@@ -1257,8 +1258,8 @@ module.exports = class ChatLogExporter {
 
 	async captureSelectedRange () {
 		const selection = this.rangeSelection;
-		if (!selection || !selection.start || !selection.end) {
-			BdApi.UI.showToast("먼저 범위의 시작·끝 메시지를 선택해줘.", {type: "info"});
+		if (!selection || !selection.messages || !selection.messages.length) {
+			BdApi.UI.showToast("먼저 선택 범위를 불러와줘.", {type: "info"});
 			return;
 		}
 		if (this.shotBusy) {BdApi.UI.showToast("이미 스크린샷을 만드는 중이야.", {type: "info"}); return;}
@@ -1273,27 +1274,23 @@ module.exports = class ChatLogExporter {
 		this.shotBusy = true;
 		this.shotImgCache = this.shotImgCache || new Map();
 		this.removeRangeModal();
-		const progress = this.showShotProgress("스크린샷 준비 중...");
-		let savedScrollTop = null, savedScroller = null;
+		const progress = this.showShotProgress("스크린샷 만드는 중...");
+		let savedScroller = null, savedScrollTop = null;
 		try {
 			const located = this.findMessageScroller(channelId, olderId, newerId);
 			if (!located) throw new Error("화면에서 메시지 목록을 찾지 못했어. 그 채널이 열려 있는지 확인해줘.");
 			savedScroller = located.scroller; savedScrollTop = located.scroller.scrollTop;
-			this.shotImgStats = {ok: 0, fail: 0};
 			this.updateShotProgress(progress, "폰트·스타일 준비 중...");
 			const fontCss = await this.buildFontEmbedCss(located.list);
 			const bg = this.resolveListBg(located.list);
-			const result = await this.captureRangeStrips({
-				scroller: located.scroller, list: located.list, channelId, olderId, newerId, fontCss, bg,
-				onProgress: text => this.updateShotProgress(progress, text)
-			});
+			const messages = [...selection.messages].sort((a, b) => this.compareSnowflakes(a.id, b.id));
+			const result = await this.captureRangeStrips({scroller: located.scroller, list: located.list, channelId, olderId, newerId, fontCss, bg, messages, onProgress: t => this.updateShotProgress(progress, t)});
 			if (result.cancelled) {BdApi.UI.showToast("스크린샷을 취소했어.", {type: "info"}); return;}
-			if (!result.strips.length) throw new Error("캡처할 메시지를 찾지 못했어. 선택한 범위가 현재 채널에 있는지 확인해줘.");
-			const st = this.shotImgStats || {ok: 0, fail: 0};
-			console.log(`[ChatLogExporter] 이미지 받기: 성공 ${st.ok} / 실패 ${st.fail}`);
+			if (!result.strips.length) throw new Error("캡처할 메시지를 찾지 못했어. 선택한 채널이 맞는지 확인해줘.");
 			this.updateShotProgress(progress, "이미지 이어붙이는 중...");
 			const dataUrls = this.stitchStrips(result.strips, bg);
 			if (!dataUrls.length) throw new Error("이미지를 만들지 못했어.");
+			try {this.fs.mkdirSync(this.getCacheRoot(), {recursive: true}); dataUrls.forEach((u, i) => this.fs.writeFileSync(this.path.join(this.getCacheRoot(), `last-shot-${String(i + 1).padStart(2, "0")}.png`), Buffer.from(String(u).replace(/^data:image\/png;base64,/, ""), "base64")));} catch (_) {}
 			const channelName = this.getChannelName(selection.channel) || channelId;
 			const base = `${this.sanitizeFileName(selection.scope.name)}_${this.sanitizeFileName(channelName)}_Screenshot_${this.formatFileTimestamp(new Date())}`;
 			this.showScreenshotPreview(dataUrls, base, result.messageCount);
@@ -1303,7 +1300,6 @@ module.exports = class ChatLogExporter {
 			BdApi.UI.showToast(`스크린샷 실패: ${error && error.message ? error.message : error}`, {type: "error"});
 		}
 		finally {
-			// Put the user's view back where it was before we scrolled around.
 			if (savedScroller && savedScrollTop != null) {try {savedScroller.scrollTop = savedScrollTop;} catch (_) {}}
 			this.removeShotProgress(progress);
 			this.shotBusy = false;
@@ -1345,21 +1341,6 @@ module.exports = class ChatLogExporter {
 	}
 
 	sleepShot (ms) {return new Promise(resolve => setTimeout(resolve, ms));}
-
-	async waitRowImages (scope, timeout = 1600) {
-		let imgs = [];
-		try {imgs = Array.from(scope.querySelectorAll("img"));} catch (_) {return;}
-		const pending = imgs.filter(img => !img.complete || img.naturalWidth === 0);
-		if (!pending.length) return;
-		await Promise.race([
-			Promise.all(pending.map(img => new Promise(resolve => {
-				const done = () => resolve();
-				img.addEventListener("load", done, {once: true});
-				img.addEventListener("error", done, {once: true});
-			}))),
-			this.sleepShot(timeout)
-		]);
-	}
 
 	// URL that an image-bearing node points at. Discord draws avatars as SVG
 	// <image> (masked), not <img>, so we must read href/xlink:href too.
@@ -1539,7 +1520,11 @@ module.exports = class ChatLogExporter {
 			}
 		}
 		catch (_) {}
-		const canvas = await this.rasterizeSvgLayer(host, width, height, bg, fontCss);
+		// Render with a bottom buffer so the last message is never clipped when the
+		// SVG's (embedded-font) metrics differ slightly from the page's, then trim
+		// the blank buffer away so strips stay contiguous. This fixes "메시지가 잘려".
+		const buffer = Math.round(height * 0.22) + 64;
+		const canvas = await this.rasterizeSvgLayer(host, width, height + buffer, bg, fontCss);
 		if (!canvas) return null;
 		if (imgJobs.length) {
 			const scale = canvas.width / width;
@@ -1563,7 +1548,55 @@ module.exports = class ChatLogExporter {
 				im.src = j.src;
 			})));
 		}
-		return canvas;
+		return this.removeBlankBands(canvas, bg);
+	}
+
+	// Remove large blank horizontal bands anywhere in the strip (the render buffer
+	// and any gap from host/SVG height mismatch), while keeping normal message
+	// spacing. Fixes the blank gaps regardless of what caused them.
+	removeBlankBands (canvas, bg, maxGap = 28) {
+		try {
+			const w = canvas.width, h = canvas.height;
+			const ctx = canvas.getContext("2d");
+			const data = ctx.getImageData(0, 0, w, h).data;
+			// Sample the ACTUAL background from the rendered canvas (a top corner is
+			// almost always the margin). Trusting the passed bg string failed when it
+			// didn't match the rendered color, so nothing got trimmed → blank gaps.
+			let br, bgb, bb;
+			{const px = (2 * w + (w - 3)) * 4; br = data[px]; bgb = data[px + 1]; bb = data[px + 2];
+			if (br === undefined) [br, bgb, bb] = this.parseRgb(bg);}
+			const isBlank = y => {
+				const base = y * w * 4;
+				let c = 0;
+				for (let x = 0; x < w; x += 2) {
+					const i = base + x * 4;
+					if (Math.abs(data[i] - br) > 10 || Math.abs(data[i + 1] - bgb) > 10 || Math.abs(data[i + 2] - bb) > 10) {if (++c >= 4) return false;}
+				}
+				return true;
+			};
+			const keep = []; // [start,end) row ranges to copy
+			let y = 0;
+			while (y < h) {
+				if (!isBlank(y)) {const s = y; while (y < h && !isBlank(y)) y++; keep.push([s, y]);}
+				else {const s = y; while (y < h && isBlank(y)) y++; const cap = Math.min(y - s, maxGap); if (cap > 0) keep.push([s, s + cap]);}
+			}
+			let totalH = keep.reduce((n, r) => n + (r[1] - r[0]), 0);
+			// trim a trailing kept-blank band entirely (no blank at the very bottom)
+			if (keep.length && isBlank(keep[keep.length - 1][0])) {totalH -= (keep[keep.length - 1][1] - keep[keep.length - 1][0]); keep.pop();}
+			if (totalH <= 0 || totalH >= h) return canvas;
+			const out = document.createElement("canvas");
+			out.width = w; out.height = totalH;
+			const octx = out.getContext("2d");
+			let dy = 0;
+			for (const [s, e] of keep) {octx.drawImage(canvas, 0, s, w, e - s, 0, dy, w, e - s); dy += (e - s);}
+			return out;
+		}
+		catch (_) {return canvas;}
+	}
+
+	parseRgb (color) {
+		const m = /rgba?\(\s*(\d+)[,\s]+(\d+)[,\s]+(\d+)/i.exec(String(color || ""));
+		return m ? [+m[1], +m[2], +m[3]] : [49, 51, 56];
 	}
 
 	rasterizeSvgLayer (host, width, height, bg, fontCss) {
@@ -1599,92 +1632,195 @@ module.exports = class ChatLogExporter {
 		});
 	}
 
-	async renderBatchStrip (batch, width, bg, fontCss) {
-		const host = document.createElement("div");
-		host.setAttribute("style", `position:fixed; left:-99999px; top:0; width:${width}px; background:${bg || "#313338"}; z-index:-2147483647; pointer-events:none;`);
-		for (const item of batch) {try {host.appendChild(this.cloneWithInlineStyles(item.el));} catch (_) {}}
-		document.body.appendChild(host);
-		let canvas = null;
+	// A real date / "new messages" divider row. Discord puts role="separator" and
+	// a divider_* class ON THE ROW ITSELF (not a descendant), e.g.
+	// <div role="separator" class="divider_… hasContent_…" aria-label="November 19, 2026">.
+	isRealDivider (row) {
 		try {
-			const w = Math.max(1, Math.round(host.offsetWidth || width));
-			const h = Math.max(1, Math.round(host.offsetHeight || host.scrollHeight || 1));
-			canvas = await this.rasterizeStripHost(host, w, h, bg, fontCss);
+			if (!String(row.textContent || "").trim()) return false;
+			if (row.getAttribute && row.getAttribute("role") === "separator") return true;
+			if (/divider/i.test(row.className || "")) return true;
+			return !!(row.querySelector && row.querySelector('[role="separator"], [class*="divider"]'));
 		}
-		catch (_) {canvas = null;}
-		finally {try {host.remove();} catch (_) {}}
-		return canvas ? {canvas, orderId: batch[0].orderId} : null;
+		catch (_) {return false;}
 	}
 
-	// Scroll the open channel from the first selected message to the last and
-	// capture one strip per screenful of newly-seen in-range rows.
-	async captureRangeStrips ({scroller, list, channelId, olderId, newerId, fontCss, bg, onProgress}) {
+	// A loading skeleton row = an unloaded block of messages Discord draws as a
+	// fixed-height wrapper (e.g. <div class="wrapper_…" style="height:1469px">) with
+	// aria-hidden skeleton content and no chat-messages id. We must scroll into
+	// these and WAIT for them to load, never capture or skip them.
+	isSkeletonRow (row) {
+		try {
+			if (this.parseRowMessageId(row)) return false;
+			if (this.isRealDivider(row)) return false;
+			if (/placeholder|skeleton/i.test(row.className || "")) return true;
+			const h = parseFloat((row.style && row.style.height) || "") || 0;
+			if (h > 40) return true; // fixed-height unloaded block
+			if (h === 0 && !String(row.textContent || "").trim() && row.querySelector && row.querySelector('[aria-hidden="true"][class*="avatar"], [class*="placeholder"]')) return true;
+			return false;
+		}
+		catch (_) {return false;}
+	}
+
+	// Use Discord's own "jump to message" to navigate to an arbitrary message: it
+	// loads that message WITH context and lets us scroll away from it normally —
+	// the reliable way to reach the end of a long range (scrolling down toward it
+	// doesn't load newer messages when we're parked up in history).
+	jumpMod () {
+		if (!this._jumpMod) {try {this._jumpMod = BdApi.Webpack.getModule(m => m && (typeof m.jumpToMessage === "function" || typeof m.jumpToPresent === "function"));} catch (_) {}}
+		return this._jumpMod;
+	}
+	jumpToMessage (channelId, messageId) {
+		try {const m = this.jumpMod(); if (m && m.jumpToMessage) {m.jumpToMessage({channelId: String(channelId), messageId: String(messageId), flash: false}); return true;}}
+		catch (_) {}
+		return false;
+	}
+	// Return to the live/present view. Only from here does scrolling up reliably
+	// load older history indefinitely; after a mid-history jump it stops.
+	jumpToPresent (channelId) {
+		try {const m = this.jumpMod(); if (m && m.jumpToPresent) {m.jumpToPresent(String(channelId)); return true;}}
+		catch (_) {}
+		return false;
+	}
+
+	// Capture the range by JUMPING across it. Programmatic scrolling only makes
+	// Discord load ~1-2 batches of history before it stops, so long ranges can't be
+	// walked by scrolling. But we already have every message id in the range, and
+	// Discord's jumpToMessage reliably loads ANY message with its surrounding
+	// window. So we jump to successive points across the range, capture the loaded
+	// window at each (scrolling only WITHIN what the jump loaded), and advance past
+	// everything captured — covering the whole range regardless of length. Each
+	// jump recreates the list DOM, so we re-find the scroller/list every time.
+	async captureRangeStrips ({scroller: initScroller, list: initList, channelId, olderId, newerId, fontCss, bg, messages, onProgress}) {
 		const strips = [];
+		this._stripDbg = [];
 		const capturedIds = new Set();
 		const capturedDiv = new Set();
-		let messageCount = 0;
-		const step = () => Math.max(120, Math.round(scroller.clientHeight * 0.85));
-		const contentWidth = list.clientWidth || scroller.clientWidth || 700;
+		// Store a STYLED CLONE of every captured row keyed by id. We render nothing
+		// during the jump-scan (jumps capture messages out of order and interleaved);
+		// afterwards we sort all clones by id and render contiguous strips, so the
+		// output is in order with no gaps.
+		const clones = new Map();     // id → cloned element (message)
+		const divClones = new Map();  // "beforeId" → cloned divider element
+		const defaultWidth = (initList && initList.clientWidth) || (initScroller && initScroller.clientWidth) || 700;
+		const sorted = [...(messages || [])].sort((a, b) => this.compareSnowflakes(a.id, b.id));
+		if (!sorted.length) return {strips, messageCount: 0, reachedStart: false, reachedEnd: false, iters: 0};
 
-		let guard = 0;
-		while (guard++ < 6000) {
-			if (this.shotCancel) return {strips, messageCount, cancelled: true};
-			if (this.getRowEl(channelId, olderId)) break;
-			const before = scroller.scrollTop;
-			scroller.scrollTop = Math.max(0, scroller.scrollTop - step());
-			await this.sleepShot(95);
-			if (onProgress) onProgress("시작 메시지로 이동하는 중...");
-			if (scroller.scrollTop === 0) {await this.sleepShot(260); if (this.getRowEl(channelId, olderId)) break; if (before === 0) break;}
-		}
-		const startEl = this.getRowEl(channelId, olderId);
-		if (startEl) {try {startEl.scrollIntoView({block: "start"});} catch (_) {} await this.sleepShot(160);}
-
-		let noProgress = 0, iter = 0, endReached = false;
-		while (iter++ < 10000) {
-			if (this.shotCancel) return {strips, messageCount, cancelled: true};
-			for (let w = 0; w < 8 && this.hasPlaceholder(list); w++) await this.sleepShot(180);
+		const locate = () => {
+			let l = null;
+			try {l = document.querySelector('ol[data-list-id^="chat-messages"], ol[class*="scrollerInner"]');} catch (_) {}
+			if ((!l || !document.body.contains(l)) && initList && document.body.contains(initList)) l = initList;
+			if (!l) return null;
+			const s = l.closest('div[class*="scroller"]') || l.parentElement;
+			return s ? {scroller: s, list: l} : null;
+		};
+		const hasSkeletonIn = list => {try {for (const r of list.children) if (this.isSkeletonRow(r)) return true;} catch (_) {} return false;};
+		const settle = async (list, maxMs = 2200) => {
+			const t0 = Date.now();
+			while (Date.now() - t0 < maxMs) {if (this.shotCancel) return; if (!hasSkeletonIn(list)) return; await this.sleepShot(110);}
+		};
+		const captureVisible = async list => {
 			const rows = Array.from(list.children);
-			const batch = [];
-			let pendingDiv = [];
+			let pendingDiv = [], added = 0;
 			for (const row of rows) {
-				if (this.isPlaceholderRow(row)) {pendingDiv = []; continue;}
 				const mid = this.parseRowMessageId(row);
 				if (mid) {
 					const inRange = this.compareSnowflakes(mid, olderId) >= 0 && this.compareSnowflakes(mid, newerId) <= 0;
 					if (inRange) {
-						for (const d of pendingDiv) {const dk = `d:${mid}:${d.text}`; if (!capturedDiv.has(dk)) {capturedDiv.add(dk); batch.push({el: d.el, orderId: mid});}}
+						for (const d of pendingDiv) {const dk = `${mid}:${d.text}`; if (!capturedDiv.has(dk)) {capturedDiv.add(dk); try {divClones.set(mid + "\u0000" + d.text, this.cloneWithInlineStyles(d.el));} catch (_) {}}}
 						pendingDiv = [];
-						if (!capturedIds.has(mid)) {capturedIds.add(mid); messageCount++; batch.push({el: row, orderId: mid});}
-						if (this.compareSnowflakes(mid, newerId) >= 0) endReached = true;
+						if (!capturedIds.has(mid)) {
+							capturedIds.add(mid);
+							await this.prefetchRowImages(row).catch(() => {});
+							try {clones.set(mid, this.cloneWithInlineStyles(row)); added++;} catch (_) {}
+						}
 					}
 					else pendingDiv = [];
 				}
-				else {
+				else if (this.isRealDivider(row)) {
 					const text = String(row.textContent || "").trim().replace(/\s+/g, " ").slice(0, 48);
 					pendingDiv.push({el: row, text});
 				}
 			}
-			if (batch.length) {
-				await Promise.all(batch.map(b => this.prefetchRowImages(b.el))).catch(() => {});
-				const strip = await this.renderBatchStrip(batch, contentWidth, bg, fontCss);
-				if (strip) strips.push(strip);
-			}
-			if (onProgress) onProgress(`캡처 중 · ${messageCount.toLocaleString()}개 메시지 · ${strips.length}장`);
-			if (endReached && capturedIds.has(String(newerId))) break;
+			return added;
+		};
 
-			const before = scroller.scrollTop;
-			scroller.scrollTop = Math.min(scroller.scrollHeight, scroller.scrollTop + step());
-			await this.sleepShot(110);
-			if (Math.abs(scroller.scrollTop - before) < 2) {noProgress++; if (noProgress >= 4) break;}
-			else noProgress = 0;
+		// --- Capture phase: jump across the range, store clones. ---
+		const total = sorted.length;
+		let i = 0, jumps = 0;
+		while (i < total) {
+			if (this.shotCancel) return {strips, messageCount: capturedIds.size, cancelled: true, reachedStart: capturedIds.has(String(olderId)), reachedEnd: capturedIds.has(String(newerId)), iters: jumps};
+			const prevI = i;
+			const targetId = String(sorted[i].id);
+			if (!this.getRowEl(channelId, targetId)) {
+				this.jumpToMessage(channelId, targetId);
+				jumps++;
+				for (let w = 0; w < 60 && !this.getRowEl(channelId, targetId); w++) {if (this.shotCancel) break; await this.sleepShot(140);}
+			}
+			let loc = locate();
+			if (loc) {
+				const el = this.getRowEl(channelId, targetId);
+				if (el) {try {el.scrollIntoView({block: "start"});} catch (_) {} await this.sleepShot(160);}
+				for (let k = 0; k < 16; k++) {
+					if (this.shotCancel) break;
+					loc = locate() || loc;
+					await settle(loc.list, 1600);
+					await captureVisible(loc.list);
+					if (onProgress) onProgress(`캡처 중 · ${capturedIds.size.toLocaleString()} / ${total.toLocaleString()}개`);
+					const s = loc.scroller, before = s.scrollTop;
+					s.scrollTop = Math.min(s.scrollHeight, s.scrollTop + Math.round((s.clientHeight || 600) * 0.82));
+					await this.sleepShot(120);
+					if (s.scrollTop - before < 2) break;
+					if (hasSkeletonIn(loc.list)) break;
+				}
+			}
+			while (i < total && capturedIds.has(String(sorted[i].id))) i++;
+			if (i === prevI) i++;
 		}
-		return {strips, messageCount};
+		const messageCount = capturedIds.size;
+
+		// --- Render phase: sort clones by id, render contiguous strips. ---
+		if (onProgress) onProgress("이미지 만드는 중...");
+		const ordered = [];
+		for (const id of [...clones.keys()].sort((a, b) => this.compareSnowflakes(a, b))) {
+			// a date divider that precedes this message
+			for (const [dk, dv] of divClones) {if (dk.split("\u0000")[0] === id) {ordered.push({clone: dv, orderId: id}); divClones.delete(dk);}}
+			ordered.push({clone: clones.get(id), orderId: id});
+		}
+		const TARGET = Math.max(800, Math.min(4000, Math.round((Number(this.settings.shotMaxHeight) || 15000) / 4)));
+		const host = document.createElement("div");
+		host.setAttribute("style", `position:fixed; left:-99999px; top:0; width:${defaultWidth}px; background:${bg || "#313338"}; z-index:-2147483647; pointer-events:none;`);
+		document.body.appendChild(host);
+		let curOrderId = null, curCount = 0;
+		const flush = async () => {
+			if (!host.firstChild) return;
+			const w = Math.max(1, Math.round(host.offsetWidth || defaultWidth));
+			const h = Math.max(1, Math.round(host.offsetHeight || 1));
+			let canvas = null;
+			try {canvas = await this.rasterizeStripHost(host, w, h, bg, fontCss);} catch (_) {}
+			if (canvas) {strips.push({canvas, orderId: curOrderId}); this._stripDbg.push(`#${strips.length} rows=${curCount} measuredH=${h} finalH=${canvas.height}`);}
+			while (host.firstChild) host.removeChild(host.firstChild);
+			curOrderId = null; curCount = 0;
+		};
+		for (const item of ordered) {
+			if (this.shotCancel) break;
+			if (!item.clone) continue;
+			if (curOrderId === null) curOrderId = item.orderId;
+			host.appendChild(item.clone);
+			curCount++;
+			if (host.offsetHeight >= TARGET) await flush();
+		}
+		await flush();
+		try {host.remove();} catch (_) {}
+
+		return {strips, messageCount, reachedStart: capturedIds.has(String(olderId)), reachedEnd: capturedIds.has(String(newerId)), iters: jumps};
 	}
 
 	stitchStrips (strips, bg) {
 		const items = [...strips].sort((a, b) => this.compareSnowflakes(a.orderId, b.orderId));
 		if (!items.length) return [];
 		const width = items.reduce((max, s) => Math.max(max, s.canvas.width), 0) || 1;
-		const maxHeight = 15000;
+		const maxHeight = Math.max(1500, Math.min(30000, Number(this.settings.shotMaxHeight) || 15000));
 		const groups = []; let current = [], currentHeight = 0;
 		for (const s of items) {const h = s.canvas.height; if (current.length && currentHeight + h > maxHeight) {groups.push(current); current = []; currentHeight = 0;} current.push(s); currentHeight += h;}
 		if (current.length) groups.push(current);
@@ -1696,25 +1832,22 @@ module.exports = class ChatLogExporter {
 			const ctx = canvas.getContext("2d");
 			ctx.fillStyle = bg || "#313338"; ctx.fillRect(0, 0, width, total);
 			let y = 0; for (const s of group) {ctx.drawImage(s.canvas, 0, y); y += s.canvas.height;}
-			out.push(canvas.toDataURL("image/png"));
+			// Final safeguard: collapse any residual blank (between strips or trailing)
+			// on the fully-stitched image, so the output never ends on an empty band.
+			const trimmed = this.removeBlankBands(canvas, bg);
+			// Give the bottom the same small breathing room Discord shows under the last
+			// message (otherwise the image ends flush against the last line of text).
+			const pad = 16;
+			const padded = document.createElement("canvas");
+			padded.width = trimmed.width; padded.height = trimmed.height + pad;
+			const pctx = padded.getContext("2d");
+			let fill = bg || "#313338";
+			try {const d = trimmed.getContext("2d").getImageData(trimmed.width - 3, 2, 1, 1).data; fill = `rgb(${d[0]},${d[1]},${d[2]})`;} catch (_) {}
+			pctx.fillStyle = fill; pctx.fillRect(0, 0, padded.width, padded.height);
+			pctx.drawImage(trimmed, 0, 0);
+			out.push(padded.toDataURL("image/png"));
 		}
 		return out;
-	}
-
-	hasPlaceholder (scope) {
-		try {return !!scope.querySelector('[class*="placeholder"], [class*="Placeholder"], [class*="skeleton"], [class*="Skeleton"]');}
-		catch (_) {return false;}
-	}
-
-	isPlaceholderRow (row) {
-		try {
-			if (/placeholder|skeleton/i.test(row.className || "")) return true;
-			// A real message row carries a chat-messages id; a still-loading skeleton
-			// row does not. If it has no id AND holds a placeholder/skeleton node,
-			// treat it as not-ready.
-			return !!row.querySelector('[class*="placeholder"], [class*="Placeholder"], [class*="skeleton"], [class*="Skeleton"]');
-		}
-		catch (_) {return false;}
 	}
 
 	// Full-screen overlay that BOTH shows progress AND blocks the user from
@@ -4024,6 +4157,20 @@ module.exports = class ChatLogExporter {
 		updateRow.append(checkBtn, repoBtn); panel.appendChild(updateRow);
 		divider();
 
+		section("스크린샷");
+		const shotNote = document.createElement("div"); shotNote.className = "cle-note"; shotNote.textContent = "긴 대화는 이 길이를 넘으면 여러 장으로 잘라서 저장돼."; panel.appendChild(shotNote);
+		const shotRowS = document.createElement("div"); shotRowS.className = "cle-row";
+		const shotLabel = document.createElement("span"); shotLabel.className = "cle-note"; shotLabel.textContent = "한 장 최대 세로 길이";
+		const shotSel = document.createElement("select"); shotSel.className = "cle-select";
+		for (const [value, label] of [["4000", "짧게 (4000px)"], ["8000", "보통 (8000px)"], ["15000", "길게 (15000px)"], ["22000", "아주 길게 (22000px)"], ["30000", "최대 (30000px)"]]) {
+			const opt = document.createElement("option"); opt.value = value; opt.textContent = label; shotSel.appendChild(opt);
+		}
+		shotSel.value = String(Math.max(1500, Math.min(30000, Number(this.settings.shotMaxHeight) || 15000)));
+		if (!Array.from(shotSel.options).some(o => o.value === shotSel.value)) shotSel.value = "15000";
+		shotSel.addEventListener("change", () => {this.settings.shotMaxHeight = Number(shotSel.value) || 15000; this.saveSettings();});
+		shotRowS.append(shotLabel, shotSel); panel.appendChild(shotRowS);
+		divider();
+
 		section("내보낼 항목");
 		panel.appendChild(this.makeSettingCheckbox("첨부파일 URL 포함", "includeAttachments"));
 		panel.appendChild(this.makeSettingCheckbox("임베드 정보 포함", "includeEmbeds"));
@@ -4125,8 +4272,16 @@ module.exports = class ChatLogExporter {
 	async reportError (context, error) {
 		const details = this.serializeError(context, error);
 		console.error("[ChatLogExporter]", context, error);
-		const copied = await this.copyText(details);
-		BdApi.UI.alert("ChatLogExporter 오류", `${context} 중 오류가 발생했어.\n\n${copied ? "진단 정보가 클립보드에 복사됐어." : "클립보드 복사에 실패했어. 콘솔에도 기록했어."}\n\n${details}`);
+		// Write diagnostics to a FILE instead of the clipboard — auto-copying here
+		// used to clobber whatever the user was typing/had copied.
+		let savedPath = "";
+		try {
+			this.fs.mkdirSync(this.getCacheRoot(), {recursive: true});
+			savedPath = this.path.join(this.getCacheRoot(), "last-error.txt");
+			this.fs.writeFileSync(savedPath, details, "utf8");
+		}
+		catch (_) {}
+		BdApi.UI.alert("ChatLogExporter 오류", `${context} 중 오류가 발생했어.\n\n${savedPath ? `진단 정보를 파일에 저장했어:\n${savedPath}` : "콘솔에 기록했어."}\n\n${details}`);
 	}
 	safeAction (context, fn) {try {const result = fn(); if (result && typeof result.catch === "function") result.catch(error => this.reportError(context, error));} catch (error) {this.reportError(context, error);}}
 };
